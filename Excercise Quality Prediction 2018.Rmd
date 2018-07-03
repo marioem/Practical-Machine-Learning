@@ -1,0 +1,541 @@
+---
+title: "Prediction of Excercise Quality - Practical Machine Learning Assignment"
+author: "Mariusz Musiał"
+date: "31 stycznia 2016"
+output: html_document
+graphics: yes
+---
+# Introduction
+
+The purpose of this assignment is to predict how well the subjects are excercising based on a number of predictors gathered during the experiments performed by Velloso et al. [[1]](#Ref1). The excercises which are subject to this prediction assignment correspond to Weight Lifting Excercises [[2]](#Ref2).
+
+The training data set and the test data set (called quizz data set from now on to avoid confusion) are available as downloadable csv files in [[3]](#Ref3) and [[4]](#Ref4). The train data set contains the class variable (`classe` in the data set) whereas the quizz data set is stripped from this variable. The goal of this prediction excercise is to assign each observation in the quizz data set to one of the five classes A through E [[1]](#Ref1). Class A is the correctly executed excercise whereas classes B through E mark incorrectly executed excercises in a predefined way.
+
+**Loading and exploration of the data sets**
+
+The following code chunk downloads the data sets and loads it into R. It also loads required libraries and defines a function to test the score on the quizz data set. The correct score was obtined during work on the different models.
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+#library(VIM)
+library(ggplot2)
+library(caret)
+library(pander)
+#library(dplyr)
+library(randomForest)
+library(doMC)
+
+registerDoMC(cores = 4)
+modelNo <- 0
+resultsdf <- data.frame(ModelID = numeric(0), OOBModelError = numeric(0), OOBTestError = numeric(0), Score = numeric(0))
+
+score <- function(pred) {
+    correct <- c("B", "A", "B", "A", "A", "E", "D", "B", "A", "A", "B", "C", "B", "A", "E", "E", "A", "B", "B", "B")
+    score <- sum(pred == correct)
+    score
+}
+
+trainurl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testurl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+    
+if(!file.exists("pml-training.csv")) {
+    download.file(trainurl, destfile = "pml-training.csv", method = "curl")
+}
+
+if(!file.exists("pml-testing.csv")) {
+    download.file(testurl, destfile = "pml-testing.csv", method = "curl")
+}
+
+train <- read.csv("pml-training.csv",stringsAsFactors = F)
+test <- read.csv("pml-testing.csv",stringsAsFactors = F)
+```
+
+The loaded data sets have the following sizes:
+
+```{r}
+dim(train)
+dim(test)
+```
+
+Detailed examination of the variables reveals four groups of them:
+
+- Observation identification variables
+- Measurement variables
+- Post-processing variables
+- Class variable (training set)/Problem ID variable (quizz set)
+
+Observation identification variables are the first seven variables in the data sets:
+
+```{r}
+names(train[,1:7])
+```
+
+It was noticed, that during loading of the data some variables which are containing numerical data are stored in R as character. These variables need to be converted to correct format.
+
+    ```{r, warning=FALSE}
+    # some variables which seem to be numerical are read in as character
+    cv <- names(train[,sapply(train, class) == "character"])
+    cv <- cv[-c(1,2,3,37)]
+    
+    for(i in cv){
+        train[,i] <- as.numeric(train[,i])
+    }
+    ```
+
+The next step is to verify the completness of the data, that is, if any of the variables contain missing data and the extent of this:
+
+```{r}
+cmtr <- colMeans(apply(train,2, is.na))
+cmtst <- colMeans(apply(test,2, is.na))
+# There is a pattern in missing data. 
+unique(cmtr) # data is either complete or between 98% and 100% is missing
+unique(cmtst)  # data is either complete or 100% is missing
+```
+
+It can be seen that in the test set there are some variables which are missing about 98% of the observation and in the quizz set some variables are missing 100% of observations.
+
+Closer analysis shows, that all the variables exhibiting missing data belong to the post-processing variables, i.e. variables which - judging from their names - were introduced in the data set as the result of some calculations on the measurement variables. We check therefore if the number and variables themselves coincide between the training and quizz set, and if so, we remove them from both sets.
+
+```{r, warning=FALSE}
+sum(cmtr > 0)
+sum(cmtst > 0)
+
+# As in the test data there are variables which miss 100% data we remove them
+# as they will not provide any value
+
+missing <- rbind(cmtr, cmtst)
+# Check if the missing data affects the same column (if yes, the result is 0)
+difcol <- sum(xor(cmtr, cmtst))
+
+if(difcol == 0){
+    train <- train[,missing[1,]*missing[2,] == 0]
+    test <- test[,missing[1,]*missing[2,] == 0]
+} else
+    cat("Variables with missing data don't coincide between train and quizz set")
+```
+
+Observation Identification Variables have also been removed from both data sets, so that the final number of predictors have been drastically reduced. Class variable (`classe`) has also been converted to factor.
+
+```{r}
+    predtrain <- train[,-c(1:7)]
+    predtrain[,which(names(predtrain) == "classe")] <- as.factor(predtrain[,which(names(predtrain) == "classe")])
+    predtest <- test[,-c(1:7)]
+    
+    dim(predtrain)
+    dim(predtest)
+```
+
+The resulting training data set has been tested for unique value or near zero variance:
+
+```{r}
+nzv <- nearZeroVar(predtrain, saveMetrics= TRUE)
+grepl("TRUE", nzv[,3:4])
+```
+
+None of the variables has unique value or near zero variance.
+
+The last check before working on the model selection is the correlation beteween predictors. If there are highly correlated predictors, they can be reduced to smaller number of uncorrelated ones and some models performance can be evaluated on this reduced predictor set. Highly correlated predictors are chosen those with the absolute value of the correlation coefficient grater than 75%.
+
+```{r}
+# Check for correlated predictors
+descrCor <- cor(predtrain[,-which(names(predtrain) == "classe")])
+summary(descrCor[upper.tri(descrCor)])
+
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .75)
+numofcor <- length(highlyCorDescr)
+numofcor
+```
+
+The correlation test reveals that there are `r numofcor` correlated predictors, so we might be interested in preparing an alternative training and quizz test with reduced number of predictors:
+
+```{r}
+predtrain2 <- predtrain[,-highlyCorDescr]
+predtest2 <- predtest[,-highlyCorDescr]
+descrCor <- cor(predtrain2[,-which(names(predtrain2) == "classe")])
+summary(descrCor[upper.tri(descrCor)])
+```
+
+As there are highy correlated variables in the train data set, the alternative approach to them can be pre-processing the training and quizz set applying Principal Component Analysis (PCA) before training the model.
+
+# Prediction
+
+## Model Building
+
+The task of this assignment belongs to a classification problem class. Two models were selected to check their performance for this assignment:
+
+1. Random Forest (randomForest package)
+2. Generalized Boosted Regression Models (gbm package)
+
+Random Forest model was chosen due to its desired properties for this prediction task, and in particular, quoted from [[5]](#Ref5):
+
+- It is unexcelled in accuracy among current algorithms
+- It runs efficiently on large data bases
+- It generates an internal unbiased estimate of the generalization error as the forest building progresses
+- It has methods for balancing error in class population unbalanced data sets
+
+Random Forest has one very important property, namely "In random forests, there is no need for cross-validation or a separate test set to get an unbiased estimate of the test set error" ([[5]](#Ref5)).
+
+Generalized Boosted Regression Models package was chosen to predict the goodness of the excercise under the hypothesis that the available predictors are weak ones and boosted trees method would improve the model performance.
+
+Gbm and Random Forest models are tranied through the caret package. Additionally, Random Forest model was trained directly through the call to randomForest function. In total 22 models were trained and their perfomrance evaluated. Due to very time consuming training process, only a small subset of trained model is included in this report.
+
+Looking for the best model the following variables were modified (not all showed in this report):
+
+- split ratio of the training data set into the actual training set and test set
+- pre-processing of predictors
+- cross-validation methods (when using caret package)
+- tuning parameters for Random Forest.
+
+## Model cross-validation
+
+As mentioned above, after [[5]](#Ref5), Random Forest models provide the unbiased estimate of the test set error (OOB - out-of-bag) without the need for separate cross-validation. For the learning and evaluation purposes in this assignment we use however the caret's ability to cross-validate the model during training using 10-fold and 10 times repeated 10-fold cross-validation to estimate the model error on a test set held-out explicitely from the training set. This approach apply also to gbm model. The model error is estimated as (1 - `Accuracy`) * 100%, where `Accuracy` is the accuracy calculated by the `train` function for the "winning" model.
+
+For the directly trained Random Forest models (call to `randomForest` function) no extra cross-validation is performed. Instead OOB error is calculated based on the model's accuracy.
+
+For every model, for which a separate test set was held-out from training set, a confusion matrix is calculated using `confusionMatrix` function. This function provides the model accuracy on the training set, which is used to calculate Traning OOB error.
+
+## Models training and testing
+
+### Random Forest, caret, model 1
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 90/10 split into training and testing set
+- PCA pre-processing
+- 10-fold Cross Validation
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.9, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+ctrl <- trainControl(method = "cv", allowParallel = T, classProbs = TRUE)
+set.seed(728665723)
+modelFit3 <- train(classe ~ .,method="rf", preProcess="pca", 
+                   trControl = ctrl, data=ptrTraining, tuneGrid = data.frame(mtry = 5))
+oob3 <- 100*(1-modelFit3$results[modelFit3$results$mtry ==
+                                     as.integer(modelFit3$bestTune), 2])
+
+confmat3 <- confusionMatrix(ptrTesting$classe,predict(modelFit3,ptrTesting))
+testoob3 <- 100*(1-confmat3$overall[1])
+score3 <- score(predict(modelFit3, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(data.frame(ModelID = modelNo, OOBModelError = oob3, OOBTestError = testoob3, Score = score3))
+```
+
+### Random Forest, caret, model 2
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 90/10 split into training and testing set
+- removed highly correlated predictors
+- PCA pre-processing
+- 10-fold Cross Validation
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain2$classe, p=0.9, list=FALSE)
+ptrTraining <- predtrain2[inTrain,]
+ptrTesting <- predtrain2[-inTrain,]
+
+ctrl <- trainControl(method = "cv", allowParallel = T)
+set.seed(728665723)
+modelFit6 <- train(classe ~ .,method="rf",preProcess="pca",
+                   trControl = ctrl, data=ptrTraining, tuneGrid = data.frame(mtry = 5))
+oob6 <- 100*(1-modelFit6$results[modelFit6$results$mtry ==
+                                     as.integer(modelFit6$bestTune), 2])
+
+confmat6 <- confusionMatrix(ptrTesting$classe,predict(modelFit6,ptrTesting))
+testoob6 <- 100*(1-confmat6$overall[1])
+score6 <- score(predict(modelFit6, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oob6, OOBTestError = testoob6, Score = score6))
+```
+
+### Random Forest, caret, model 3
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 60/40 split into training and testing set
+- no pre-processing
+- 10-fold Cross Validation
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.6, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+ctrl <- trainControl(method = "cv", allowParallel = T)
+set.seed(728665723)
+modelFit11 <- train(classe ~ ., method="rf", trControl = ctrl,
+                    data=ptrTraining, tuneGrid = data.frame(mtry = 5))
+oob11 <- 100*(1-modelFit11$results[modelFit11$results$mtry ==
+                                     as.integer(modelFit11$bestTune), 2])
+
+confmat11 <- confusionMatrix(ptrTesting$classe,predict(modelFit11,ptrTesting))
+testoob11 <- 100*(1-confmat11$overall[1])
+score11 <- score(predict(modelFit11, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oob11, OOBTestError = testoob11, Score = score11))
+```
+
+### Random Forest, caret, model 4
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 60/40 split into training and testing set
+- no pre-processing
+- 10-fold Cross Validation repeated 10 times
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.6, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+ctrl <- trainControl(method = "repeatedcv", repeats = 10, allowParallel = T)
+set.seed(728665723)
+modelFit13 <- train(classe ~ ., method="rf", 
+                    trControl = ctrl, data=ptrTraining)
+oob13 <- 100*(1-modelFit13$results[modelFit13$results$mtry ==
+                                     as.integer(modelFit13$bestTune), 2])
+
+confmat13 <- confusionMatrix(ptrTesting$classe,predict(modelFit13,ptrTesting))
+testoob13 <- 100*(1-confmat13$overall[1])
+score13 <- score(predict(modelFit13, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oob13, OOBTestError = testoob13, Score = score13))
+```
+
+### Gbm, caret, model 1
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 90/10 split into training and testing set
+- PCA pre-processing
+- 10-fold Cross Validation repeated 10 times
+
+```{r, cache=TRUE, message=FALSE, warning=FALSE,error=FALSE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.9, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+ctrl <- trainControl(method = "cv", allowParallel = T)
+set.seed(728665723)
+modelFit7 <- train(classe ~ ., method="gbm",preProcess="pca",
+                               trControl = ctrl, data=ptrTraining, verbose = F)
+oob7 <- 100*(1-modelFit7$results[
+    modelFit7$results$shrinkage == modelFit7$bestTune$shrinkage &
+    modelFit7$results$interaction.depth == modelFit7$bestTune$interaction.depth &
+    modelFit7$results$n.minobsinnode == modelFit7$bestTune$n.minobsinnode &
+    modelFit7$results$n.trees == modelFit7$bestTune$n.trees,][5])
+
+names(oob7) <- NULL
+    
+confmat7 <- confusionMatrix(ptrTesting$classe,predict(modelFit7,ptrTesting))
+testoob7 <- 100*(1-confmat7$overall[1])
+score7 <- score(predict(modelFit7, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oob7, OOBTestError = testoob7, Score = score7))
+```
+
+### Random Forest, direct call, model 1
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 60/40 split into training and testing set
+- ntrees = 1000
+- mtry - default
+- no pre-processing
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.6, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+set.seed(728665723)
+modelFitRF <- randomForest(classe ~ ., data = ptrTraining, importance = T, ntree = 1000)
+oobRF <- 100*(1-sum(diag(modelFitRF$confusion))/nrow(ptrTraining))
+
+confmatRF <- confusionMatrix(ptrTesting$classe,predict(modelFitRF,ptrTesting))
+testoobRF <- 100*(1-confmatRF$overall[1])
+scoreRF <- score(predict(modelFitRF, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oobRF, OOBTestError = testoobRF, Score = scoreRF))
+```
+
+### Random Forest, direct call, model 2
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 60/40 split into training and testing set
+- ntrees = 500 (default)
+- mtry - default
+- no pre-processing
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.6, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+set.seed(728665723)
+modelFitRF2 <- randomForest(classe ~ ., data = ptrTraining, importance = T, ntree = 500)
+oobRF2 <- 100*(1-sum(diag(modelFitRF2$confusion))/nrow(ptrTraining))
+
+confmatRF2 <- confusionMatrix(ptrTesting$classe,predict(modelFitRF2,ptrTesting))
+testoobRF2 <- 100*(1-confmatRF2$overall[1])
+scoreRF2 <- score(predict(modelFitRF2, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oobRF2, OOBTestError = testoobRF2, Score = scoreRF2))
+```
+
+### Random Forest, direct call, model 3
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 60/40 split into training and testing set
+- ntrees = 500 (default)
+- mtry = 2
+- no pre-processing
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.6, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+set.seed(728665723)
+modelFitRF3 <- randomForest(classe ~ ., data = ptrTraining, importance = T, ntree = 500, mtry = 2)
+oobRF3 <- 100*(1-sum(diag(modelFitRF3$confusion))/nrow(ptrTraining))
+
+confmatRF3 <- confusionMatrix(ptrTesting$classe,predict(modelFitRF3,ptrTesting))
+testoobRF3 <- 100*(1-confmatRF3$overall[1])
+scoreRF3 <- score(predict(modelFitRF3, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oobRF3, OOBTestError = testoobRF3, Score = scoreRF3))
+```
+
+### Random Forest, direct call, model 4
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 100/0 split into training and testing set
+- ntrees = 500 (default)
+- mtry - default
+- no pre-processing
+
+Note, as we have used all the training data set to train the model, we don't have the data to test the model and verify OOB error. It is set to 0%.
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.6, list=FALSE)
+ptrTraining <- predtrain
+ptrTesting <- predtrain[-inTrain,]
+
+set.seed(728665723)
+modelFitRF4 <- randomForest(classe ~ ., data = ptrTraining, importance = T, ntree = 500)
+oobRF4 <- 100*(1-sum(diag(modelFitRF4$confusion))/nrow(ptrTraining))
+
+testoobRF4 <- 0 # Note that this result is bogus, as we don't have the test data set here
+scoreRF4 <- score(predict(modelFitRF4, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oobRF4, OOBTestError = testoobRF4, Score = scoreRF4))
+```
+
+### Random Forest, direct call, model 5
+
+**Model ID: `r modelNo <- modelNo + 1; modelNo`**
+
+This model is trained with the following assumptions:
+
+- 90/10 split into training and testing set
+- ntrees = 500 (default)
+- mtry - default
+- no pre-processing
+
+```{r, cache=TRUE}
+set.seed(987687674)
+inTrain <- createDataPartition(y=predtrain$classe, p=0.9, list=FALSE)
+ptrTraining <- predtrain[inTrain,]
+ptrTesting <- predtrain[-inTrain,]
+
+set.seed(728665723)
+modelFitRF5 <- randomForest(classe ~ ., data = ptrTraining, importance = T, ntree = 500)
+oobRF5 <- 100*(1-sum(diag(modelFitRF5$confusion))/nrow(ptrTraining))
+
+confmatRF5 <- confusionMatrix(ptrTesting$classe,predict(modelFitRF5,ptrTesting))
+testoobRF5 <- 100*(1-confmatRF5$overall[1])
+scoreRF5 <- score(predict(modelFitRF5, predtest))
+```
+
+```{r, echo=FALSE}
+resultsdf <- rbind(resultsdf, data.frame(ModelID = modelNo, OOBModelError = oobRF5, OOBTestError = testoobRF5, Score = scoreRF5))
+```
+
+## Model training results
+
+```{r, echo=FALSE}
+names(resultsdf) <- c("Model ID", "Model OOB error [%]", "Test OOB error [%]", "Quizz Score")
+rownames(resultsdf) <- NULL
+pander(resultsdf)
+```
+
+Looking at the above results the following conclusions can be drawn:
+
+- PCA pre-processig or correlated predictors removal increases the Random Forest model error. This is also visible on quizz data.
+- Boosted Tree model (gbm) performs poorly on the data used in this assignment
+- Best results are obtained using directly Random Forest, without caret.
+- The more data from training set used for model training the lower estimated model error. This estimated error corresponds closely to the error calculated on a test set, more closely so the bigger the test set.
+- The default caret training grid for Random Forest (mtry parameter) doesn't involve the default value used in randomForest function, hence probably not selecting the optimal model during training process. Direct usage of randomForest gives best and consistent results.
+
+# References
+
+<a name="Ref1"></a>[1] Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+<a name="Ref2"></a>[2] Human Activity Recognition web page: [http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises)
+
+<a name="Ref3"></a>[3] Training set: [https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+
+<a name="Ref4"></a>[4] Test set: [https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+<a name="Ref5"></a>[5] Random Forests. Leo Breiman and Adele Cutler. [http://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm](http://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm)
