@@ -24,7 +24,7 @@ library(pander)
 library(randomForest)
 library(doMC)
 
-registerDoMC(cores = 4)
+registerDoMC(cores = 6)
 modelNo <- 0
 resultsdf <- data.frame(ModelID = numeric(0), OOBModelError = numeric(0), OOBTestError = numeric(0), Score = numeric(0))
 
